@@ -1,0 +1,238 @@
+import { ChangeDetectionStrategy, Component, signal, OnInit, computed } from '@angular/core';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot } from 'firebase/firestore';
+
+const DEG_TO_RAD = Math.PI / 180;
+interface CalculatorButton { label: string; value: string; shift: string; alpha: string; style: string; action: 'input' | 'shift' | 'alpha' | 'execute' | 'clear' | 'memory' | 'delete'; }
+type Token = { type: 'number' | 'operator' | 'function' | 'parenthesis' | 'variable'; value: string | number };
+
+const KEYPAD: CalculatorButton[] = [
+  { label: 'SHIFT', value: 'SHIFT', shift: '', alpha: '', style: 'key-shift', action: 'shift' },
+  { label: 'ALPHA', value: 'ALPHA', shift: '', alpha: '', style: 'key-alpha', action: 'alpha' },
+  { label: 'MODE', value: 'MODE', shift: 'SETUP', alpha: '', style: 'key-function', action: 'memory' }, 
+  { label: 'DEL', value: 'DEL', shift: '', alpha: '', style: 'key-control bg-gray-500 text-white hover:bg-gray-400', action: 'delete' },
+  { label: 'AC', value: 'AC', shift: '', alpha: '', style: 'key-ac', action: 'clear' },
+  { label: 'sin', value: 'sin(', shift: 'asin(', alpha: 'A', style: 'key-function', action: 'input' },
+  { label: 'cos', value: 'cos(', shift: 'acos(', alpha: 'B', style: 'key-function', action: 'input' },
+  { label: 'tan', value: 'tan(', shift: 'atan(', alpha: 'C', style: 'key-function', action: 'input' },
+  { label: 'log', value: 'log10(', shift: 'pow10(', alpha: 'D', style: 'key-function', action: 'input' },
+  { label: 'ln', value: 'log(', shift: 'exp(', alpha: 'E', style: 'key-function', action: 'input' },
+  { label: '7', value: '7', shift: '', alpha: 'F', style: 'key-standard', action: 'input' },
+  { label: '8', value: '8', shift: '', alpha: 'G', style: 'key-standard', action: 'input' },
+  { label: '9', value: '9', shift: '', alpha: 'H', style: 'key-standard', action: 'input' },
+  { label: 'DEL', value: '/', shift: '%', alpha: ':', style: 'key-function', action: 'input' },
+  { label: 'x', value: '*', shift: '', alpha: 'M', style: 'key-function', action: 'input' },
+  { label: '4', value: '4', shift: '', alpha: 'I', style: 'key-standard', action: 'input' },
+  { label: '5', value: '5', shift: '', alpha: 'J', style: 'key-standard', action: 'input' },
+  { label: '6', value: '6', shift: '', alpha: 'K', style: 'key-standard', action: 'input' },
+  { label: '+', value: '+', shift: 'P', alpha: 'Q', style: 'key-function', action: 'input' },
+  { label: '-', value: '-', shift: 'R', alpha: 'S', style: 'key-function', action: 'input' },
+  { label: '1', value: '1', shift: 'Abs(', alpha: 'T', style: 'key-standard', action: 'input' },
+  { label: '2', value: '2', shift: 'Eng', alpha: 'U', style: 'key-standard', action: 'input' },
+  { label: '3', value: '3', shift: 'deg', alpha: 'V', style: 'key-standard', action: 'input' },
+  { label: '(', value: '(', shift: '(', alpha: 'W', style: 'key-standard', action: 'input' },
+  { label: ')', value: ')', shift: ')', alpha: 'X', style: 'key-standard', action: 'input' },
+  { label: '0', value: '0', shift: 'Rand', alpha: 'Y', style: 'key-standard', action: 'input' },
+  { label: '.', value: '.', shift: 'pi', alpha: 'Z', style: 'key-standard', action: 'input' },
+  { label: 'EXP', value: 'e', shift: '', alpha: '', style: 'key-function', action: 'input' },
+  { label: 'Ans', value: 'Ans', shift: 'e', alpha: '', style: 'key-function', action: 'input' },
+  { label: '=', value: '=', shift: '', alpha: '', style: 'key-equals', action: 'execute' },
+];
+
+class ExpressionParser {
+  private tokens: Token[] = []; private pos: number = 0; private ans: number;
+  constructor(expression: string, lastAns: number) { this.ans = lastAns; this.tokenize(expression.replace(/Ans/g, lastAns.toString())); }
+
+  private tokenize(expr: string): void {
+    let tempExpr = expr.replace(/pi/g, Math.PI.toString()).replace(/e/g, Math.E.toString());
+    tempExpr = tempExpr.replace(/(\d|\))\s*([a-zA-Z\(])/g, (m, p1, p2) => p1 + '*' + p2);
+    tempExpr = tempExpr.replace(/sin⁻¹/g, 'asin').replace(/cos⁻¹/g, 'acos').replace(/tan⁻¹/g, 'atan').replace(/10\^/g, 'pow10').replace(/e\^/g, 'exp');
+    
+    const regex = /(\d+\.?\d*|\.|\+|\-|\*|\/|\^|\(|\)|sin|cos|tan|log10|log|sqrt|pow10|exp|Abs|asin|acos|atan|[A-Z])/g;
+    let match; this.tokens = [];
+    while ((match = regex.exec(tempExpr)) !== null) {
+      const v = match[0].trim(); if (!v) continue;
+      if (/[0-9]/.test(v)) { this.tokens.push({ type: 'number', value: parseFloat(v) }); }
+      else if (v === '(' || v === ')') { this.tokens.push({ type: 'parenthesis', value: v }); }
+      else if (['+', '-', '*', '/', '^'].includes(v)) { this.tokens.push({ type: 'operator', value: v }); }
+      else if (['sin', 'cos', 'tan', 'log10', 'log', 'sqrt', 'pow10', 'exp', 'Abs', 'asin', 'acos', 'atan'].includes(v)) { this.tokens.push({ type: 'function', value: v }); }
+      else if (/[A-Z]/.test(v)) { this.tokens.push({ type: 'variable', value: v }); }
+    }
+  }
+  
+  private peek(): Token | null { return this.pos < this.tokens.length ? this.tokens[this.pos] : null; }
+  private consume(expectedValue?: string): Token {
+    const token = this.peek(); if (!token) throw new Error("Unexpected end of expression");
+    if (expectedValue && token.value !== expectedValue) throw new Error(`Expected '${expectedValue}' but got '${token.value}'`);
+    this.pos++; return token;
+  }
+
+  private parseFactor(): number {
+    const token = this.peek(); if (!token) throw new Error("Missing factor");
+    if (token.type === 'number') { this.consume(); return token.value as number; } 
+    if (token.type === 'variable') { this.consume(); return 0; } // Variables are 0 for now
+    if (token.type === 'function') {
+      const funcName = this.consume().value as string; this.consume('('); const arg = this.parseExpression(); this.consume(')');
+      if (['sin', 'cos', 'tan'].includes(funcName)) return Math[funcName as 'sin'|'cos'|'tan'](arg * DEG_TO_RAD);
+      if (funcName === 'asin') return Math.asin(arg) / DEG_TO_RAD;
+      if (funcName === 'acos') return Math.acos(arg) / DEG_TO_RAD;
+      if (funcName === 'atan') return Math.atan(arg) / DEG_TO_RAD;
+      if (funcName === 'log10') return Math.log10(arg);
+      if (funcName === 'log') return Math.log(arg);
+      if (funcName === 'sqrt') return Math.sqrt(arg);
+      if (funcName === 'pow10') return Math.pow(10, arg);
+      if (funcName === 'exp') return Math.exp(arg);
+      if (funcName === 'Abs') return Math.abs(arg);
+      throw new Error(`Unknown function: ${funcName}`);
+    }
+    if (token.type === 'parenthesis' && token.value === '(') { this.consume(); const result = this.parseExpression(); this.consume(')'); return result; }
+    if (token.type === 'operator' && token.value === '-') { this.consume(); return -this.parseFactor(); }
+    throw new Error(`Syntax Error at: ${token.value}`);
+  }
+
+  private parsePower(): number {
+    let left = this.parseFactor();
+    while (this.peek()?.value === '^') { this.consume(); left = Math.pow(left, this.parseFactor()); }
+    return left;
+  }
+
+  private parseTerm(): number {
+    let left = this.parsePower();
+    while (this.peek()?.value === '*' || this.peek()?.value === '/') {
+      const op = this.consume().value; const right = this.parsePower();
+      if (op === '*') left *= right;
+      else if (op === '/') { if (right === 0) throw new Error("Division by zero"); left /= right; }
+    }
+    return left;
+  }
+
+  private parseExpression(): number {
+    let left = this.parseTerm();
+    while (this.peek()?.value === '+' || this.peek()?.value === '-') {
+      const op = this.consume().value; const right = this.parseTerm();
+      if (op === '+') left += right;
+      else left -= right;
+    }
+    return left;
+  }
+  
+  public calculate(): number {
+    if (this.tokens.length === 0) return 0;
+    const result = this.parseExpression();
+    if (this.pos !== this.tokens.length) throw new Error("Trailing characters");
+    return result;
+  }
+}
+
+@Component({
+  selector: 'app-root', template: `
+    <div class="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-2 sm:p-4">
+      <div class="w-full max-w-sm bg-gray-800 rounded-xl shadow-2xl p-3 border-b-8 border-gray-900 transition-all duration-300">
+        <div class="bg-[#c3d6c3] h-20 w-full rounded-lg p-2 text-right shadow-inner mb-3 flex flex-col justify-end text-black font-mono relative">
+          <div class="flex justify-between items-center text-xs font-bold h-4">
+            <span [class.text-yellow-600]="isShiftActive()" [class.text-red-600]="isAlphaActive()" class="text-xs">
+              {{ isShiftActive() ? 'S' : (isAlphaActive() ? 'A' : '') }}
+            </span>
+            <span class="text-xs text-gray-700 overflow-x-auto whitespace-nowrap scrollbar-hide">{{ historyDisplay() }}</span>
+          </div>
+          <div class="text-lg overflow-x-auto whitespace-nowrap scrollbar-hide">{{ displayExpression() }}</div>
+        </div>
+        <div class="grid grid-cols-5 gap-1.5">
+          <button (click)="handleKey(key)" [class]="key.style" *for="let key of keypad.slice(0, 5)"><span [class.text-yellow-400]="key.value === 'SHIFT' && isShiftActive()" [class.text-red-400]="key.value === 'ALPHA' && isAlphaActive()">{{ key.label }}</span></button>
+          <ng-container *for="let key of keypad.slice(5)">
+            <button (click)="handleKey(key)" [class]="key.style">
+              <span class="text-yellow-400 absolute top-0.5 left-1 text-[8px]">{{ key.shift }}</span>
+              <span class="text-red-400 absolute top-0.5 right-1 text-[8px]">{{ key.alpha }}</span>
+              {{ key.label }}
+            </button>
+          </ng-container>
+        </div>
+      </div>
+       <div class="mt-4 text-xs text-gray-600 p-2 bg-white rounded-lg shadow">
+          <p>Current User ID: <span class="font-mono text-gray-900">{{ userId() }}</span> (Ans is saved here)</p>
+          <p class="mt-1"><span class="text-yellow-600">SHIFT</span>: Access yellow functions. <span class="text-red-600">ALPHA</span>: Access red variables.</p>
+      </div>
+    </div>
+  `,
+  styles: [
+    `.key-standard {@apply relative text-sm font-semibold rounded-md h-8 sm:h-10 bg-gray-600 text-white shadow-md hover:bg-gray-500 active:shadow-inner transition-colors duration-100;}
+    .key-function {@apply relative text-sm font-semibold rounded-md h-8 sm:h-10 bg-gray-700 text-white shadow-md hover:bg-gray-600 active:shadow-inner transition-colors duration-100;}
+    .key-control {@apply relative text-sm font-bold rounded-md h-8 sm:h-10 text-gray-900 shadow-md transition-colors duration-100;}
+    .key-shift {@apply key-control bg-yellow-500 hover:bg-yellow-400 active:shadow-inner;}
+    .key-alpha {@apply key-control bg-red-500 hover:bg-red-400 active:shadow-inner;}
+    .key-equals {@apply key-control bg-gray-500 col-span-2 text-white hover:bg-gray-400 active:shadow-inner;}
+    .key-ac {@apply key-control bg-red-600 text-white hover:bg-red-500 active:shadow-inner;}
+    .scrollbar-hide {-ms-overflow-style: none; scrollbar-width: none;}
+    .scrollbar-hide::-webkit-scrollbar {display: none;} `
+  ],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class App implements OnInit {
+  expression = signal<string>(''); result = signal<number>(0);
+  isShiftActive = signal<boolean>(false); isAlphaActive = signal<boolean>(false); history = signal<string>('0');
+  db: any; userId = signal<string>('initializing...'); keypad = KEYPAD;
+  displayExpression = computed(() => this.expression().length > 0 ? this.expression() : '0');
+  historyDisplay = computed(() => this.history());
+
+  async ngOnInit() {
+    try {
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        this.db = getFirestore(app); const auth = getAuth(app);
+        if (typeof __initial_auth_token !== 'undefined') { await signInWithCustomToken(auth, __initial_auth_token); } else { await signInAnonymously(auth); }
+        const currentUserId = auth.currentUser?.uid || crypto.randomUUID(); this.userId.set(currentUserId);
+        const docRef = doc(this.db, `artifacts/${appId}/users/${currentUserId}/calculator_state/memory`);
+        
+        onSnapshot(docRef, (docSnap) => {
+            if (docSnap.exists()) {
+                const lastAns = docSnap.data()['ans'] !== undefined ? docSnap.data()['ans'] : 0;
+                this.result.set(lastAns); this.history.set(lastAns.toString());
+            } else { this.result.set(0); this.history.set('0'); setDoc(docRef, { ans: 0 }).catch(console.error); }
+        }, (error) => { console.error("Firestore Error:", error); this.history.set(`ERR: ${error.code}`); });
+    } catch (e) { console.error("Failed to initialize Firebase:", e); this.userId.set('Auth Failed'); }
+  }
+
+  private async updateAnsMemory(newResult: number, sourceExpression: string) {
+      if (!this.db || this.userId() === 'initializing...') return;
+      const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+      const docRef = doc(this.db, `artifacts/${appId}/users/${this.userId()}/calculator_state/memory`);
+      this.result.set(newResult); this.expression.set(newResult.toString());
+      this.history.set(sourceExpression);
+      try { await setDoc(docRef, { ans: parseFloat(newResult.toFixed(12)) }, { merge: true }); } catch (e) { console.error("Failed to save Ans:", e); }
+  }
+
+  handleKey(key: CalculatorButton) {
+    let input: string = key.value;
+    if (key.action === 'shift' || key.action === 'alpha') {
+      this.isShiftActive.set(key.action === 'shift' ? !this.isShiftActive() : false);
+      this.isAlphaActive.set(key.action === 'alpha' ? !this.isAlphaActive() : false);
+      return;
+    }
+    if (this.isShiftActive() && key.shift) { input = key.shift; }
+    else if (this.isAlphaActive() && key.alpha) { input = key.alpha; }
+    
+    switch (key.action) {
+      case 'clear': this.expression.set(''); this.history.set('0'); break;
+      case 'delete': this.expression.set(this.expression().slice(0, -1)); break;
+      case 'input': this.expression.set(this.expression() + input); break;
+      case 'execute': this.calculate(); break;
+    }
+    this.isShiftActive.set(false); this.isAlphaActive.set(false);
+  }
+
+  calculate() {
+    const expr = this.expression(); const currentAns = this.result();
+    if (expr.length === 0 || expr === currentAns.toString()) return;
+    try {
+        const parser = new ExpressionParser(expr, currentAns);
+        const calculatedResult = parser.calculate();
+        if (calculatedResult === Infinity || isNaN(calculatedResult)) { this.history.set('Math ERROR'); } 
+        else {
+            const displayExpr = expr.length > 30 ? '...' + expr.substring(expr.length - 30) : expr;
+            this.updateAnsMemory(calculatedResult, displayExpr);
+        }
+    } catch (e: any) { console.error("Calculation Error:", e); this.history.set('Syntax ERROR'); }
+  }
+}
